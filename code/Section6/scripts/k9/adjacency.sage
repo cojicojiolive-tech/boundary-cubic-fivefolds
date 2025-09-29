@@ -1,0 +1,121 @@
+# adjacency.sage  (k = 9)
+# ------------------------------------------------------------
+# Purpose:
+#   Given an index set of exponent vectors (degree-3 monomials in 7 variables),
+#   compute a primitive integral 1-PS weight vector r ∈ Z^7 with sum(r) = 0
+#   such that r · i is constant for all i in the index set (i.e. the index set
+#   lies on the r-weight hyperplane).  This is the vector used to detect
+#   adjacency/walls in the GIT analysis of cubic fivefolds.
+#
+# What this script prints:
+#   Only the “Mathematica-style” fingerprint of r:
+#     - we multiply r by (-1), and
+#     - sort the entries in descending order.
+#   (No adjacency pairs are printed.)
+#
+# How it works:
+#   If i_0 is any element of indexset and D is the matrix whose rows are
+#   (i_j - i_0), then r must satisfy D * r = 0.  We also impose sum(r) = 0.
+#   Hence r is in the right kernel of the stacked matrix:
+#        A = [ D ; (1,1,1,1,1,1,1) ].
+#   We then clear denominators and divide by gcd to obtain a primitive
+#   integral vector.
+#
+# Tested with: SageMath 9.x/10.x
+# ------------------------------------------------------------
+
+# ---------- user data (k = 9) ----------
+# indexset: list of exponent vectors (each sums to 3)
+indexset = [
+    [0, 0, 3, 0, 0, 0, 0],
+    [0, 0, 2, 1, 0, 0, 0],
+    [0, 0, 1, 2, 0, 0, 0],
+    [0, 0, 0, 3, 0, 0, 0],
+    [1, 0, 0, 0, 2, 0, 0],
+    [0, 1, 0, 0, 2, 0, 0],
+    [1, 0, 0, 0, 1, 1, 0],
+    [0, 1, 0, 0, 1, 1, 0],
+    [1, 0, 0, 0, 0, 2, 0],
+    [0, 1, 0, 0, 0, 2, 0],
+    [1, 0, 1, 0, 0, 0, 1],
+    [0, 1, 1, 0, 0, 0, 1],
+    [1, 0, 0, 1, 0, 0, 1],
+    [0, 1, 0, 1, 0, 0, 1],
+]
+
+# ---------- helpers ----------
+def primitive_integer_vector(vv):
+    """
+    Clear denominators of a QQ-vector vv and divide by gcd of entries
+    to obtain a primitive vector in ZZ^n.
+    """
+    vq = vector(QQ, vv)
+    dens = [c.denominator() for c in vq]
+    L = lcm(dens) if dens else 1
+    wz = [ZZ(c * L) for c in vq]  # now integers
+    # gcd over all entries (ignore zeros)
+    g = 0
+    for a in wz:
+        g = gcd(g, abs(a))
+    g = g if g != 0 else 1
+    return vector(ZZ, [a // g for a in wz])
+
+def weight_vector_from_indexset(indexset):
+    """
+    Compute a primitive integral r with:
+       (i_j - i_0) · r = 0 for all j,
+       sum(r) = 0.
+    Returns r ∈ ZZ^7 (primitive).
+    """
+    if not indexset:
+        raise ValueError("indexset is empty.")
+
+    i0 = vector(QQ, indexset[0])
+    # Rows of D are differences (i_j - i_0)
+    D_rows = []
+    for ij in indexset[1:]:
+        D_rows.append(vector(QQ, ij) - i0)
+
+    # Append the sum-to-zero constraint as the last row
+    ones_row = vector(QQ, [1]*7)
+    A = matrix(QQ, D_rows + [ones_row])  # shape: (#rows) x 7
+
+    # r lies in the right kernel of A
+    K = A.right_kernel()  # QQ-vector space
+    basis = K.basis()
+    if len(basis) == 0:
+        raise RuntimeError("No nontrivial solution found (kernel is zero).")
+    # If kernel is higher-dimensional, choose the first basis vector.
+    r = primitive_integer_vector(basis[0])
+
+    # Optional consistency check: r·i is constant on indexset
+    # (Silent if satisfied; raises if not.)
+    c0 = sum(r[k]*i0[k] for k in range(7))
+    for ij in indexset:
+        cij = sum(r[k]*ij[k] for k in range(7))
+        if cij != c0:
+            raise RuntimeError("Inconsistent weights: r·i is not constant across indexset.")
+    # Ensure sum(r) = 0
+    if sum(r) != 0:
+        # Project to the subspace sum(r) = 0 if kernel dim > 1; otherwise, this indicates
+        # the given indexset does not admit a 1-PS with trace zero under our constraints.
+        # Here we fail loudly to keep behavior explicit.
+        raise RuntimeError("Found r with sum(r) != 0. Check the indexset or constraints.")
+    return r
+
+def mathematica_style_fingerprint(r):
+    """
+    Convert r to the 'Mathematica-style' output the user requested:
+      - multiply by (-1)
+      - sort entries in descending order
+    Returned as a plain Python list.
+    """
+    r_flip = [-int(a) for a in r]
+    return sorted(r_flip, reverse=True)
+
+# ---------- main ----------
+r = weight_vector_from_indexset(indexset)
+fingerprint = mathematica_style_fingerprint(r)
+
+# Print only the requested fingerprint (nested list to match prior format).
+print([fingerprint])

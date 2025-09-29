@@ -1,0 +1,709 @@
+// ============================================================
+// run.magma  — Single-sweep version (no iter >= 2)
+// ------------------------------------------------------------
+// - Resume-safe:
+//     * If resuming and JUMP_TO_FINAL_ON_RESUME=false: finish ONLY the current
+//       iteration (the partially processed sweep) and DO NOT start a new sweep.
+//     * If resuming and JUMP_TO_FINAL_ON_RESUME=true: skip remaining scans and
+//       jump straight to final checks.
+// - Fresh start: perform EXACTLY ONE candidate sweep (iter = 1).
+// - Append FORCED_VARS at the end.
+// - Final certification under det(P)≠0: run BOTH RAB and SAT always (if meaningful).
+// - Exactly ONE RESULT_* line per (k,l).
+// - Logs: per-step CSV and FINAL_RAB / FINAL_SAT; also RESUME_JUMP_FINAL when used.
+// ============================================================
+
+SetVerbose("Groebner", 0);
+
+// ======= User Options =======
+K := Rationals();                  // base field
+CHECK_MODE := "RAB";               // single-variable forcing in scans: "RAB" or "SAT"
+CANDIDATE_ROWS := {0,1,2,3,4,5,6}; // 0-based rows to test (empty set -> all)
+SHOW_LOGS := true;
+EARLY_THRESHOLD := 7;              // after >= this many FORCED, try early det==0
+
+// Final checks (both ALWAYS run if det≠0 is meaningful)
+DO_FINAL_RAB := true;
+DO_FINAL_SAT := false;
+
+// Jump straight to final checks upon resume (unfinished (k,l))
+JUMP_TO_FINAL_ON_RESUME := true;
+
+// ---------- Run mode ----------
+RUN_MODE := "ONE";                 // "ALL" | "ONE" | "LIST"
+SINGLE_K := 14;                     // when RUN_MODE="ONE"
+SINGLE_L := 20;                     // when RUN_MODE="ONE"
+SELECTED_PAIRS := [ [1,2], [6,2] ]; // when RUN_MODE="LIST"
+
+// ===== R-vectors (21 patterns) =====
+function BuildRVecs()
+  RVS := [ [] : i in [1..21] ];
+  RVS[1]  := [ 8, 3, 2, -1, -2, -4, -6 ];
+  RVS[2]  := [ 6, 4, 1, -1, -2, -3, -5 ];
+  RVS[3]  := [ 4, 2, 1, -1, -1, -2, -3 ];
+  RVS[4]  := [ 3, 2, 1,  0, -1, -2, -3 ];
+  RVS[5]  := [ 4, 2, 1,  0, -1, -2, -4 ];
+  RVS[6]  := [ 5, 3, 2,  1, -1, -4, -6 ];
+  RVS[7]  := [ 6, 4, 2,  1, -2, -3, -8 ];
+  RVS[8]  := [ 4, 1, 1,  0, -2, -2, -2 ];
+  RVS[9]  := [ 2, 2, 0,  0, -1, -1, -2 ];
+  RVS[10] := [ 2, 1, 0,  0, -1, -1, -1 ];
+  RVS[11] := [ 2, 0, 0,  0,  0, -1, -1 ];
+  RVS[12] := [ 3, 2, 1,  1, -1, -2, -4 ];
+  RVS[13] := [ 2, 1, 1,  0, -1, -1, -2 ];
+  RVS[14] := [ 2, 2, 0, -1, -1, -1, -1 ];
+  RVS[15] := [ 2, 1, 1,  0,  0, -2, -2 ];
+  RVS[16] := [ 2, 1, 0,  0,  0, -1, -2 ];
+  RVS[17] := [ 1, 1, 1,  0,  0, -1, -2 ];
+  RVS[18] := [ 1, 1, 0,  0,  0, -1, -1 ];
+  RVS[19] := [ 2, 2, 2,  0, -1, -1, -4 ];
+  RVS[20] := [ 1, 1, 1,  1,  0, -2, -2 ];
+  RVS[21] := [ 1, 1, 0,  0,  0,  0, -2 ];
+  return RVS;
+end function;
+
+// ===== Helpers =====
+function VarA(A, i, j)  return A.(i*7 + j + 1); end function;
+function IndexOf(i,j)   return i*7 + j + 1; end function;
+function IdxToIJ(idx)   i := (idx - 1) div 7; j := (idx - 1) mod 7; return i, j; end function;
+
+// ===== Rings and L_j =====
+function BuildRingsAndL()
+  A<g> := PolynomialRing(K, 49, "grevlex");
+  R<x0,x1,x2,x3,x4,x5,x6> := PolynomialRing(A, 7);
+  P := [ [ VarA(A, i-1, j-1 ) : j in [1..7] ] : i in [1..7] ];
+  L := [ &+[ P[i][j]*R.(i) : i in [1..7] ] : j in [1..7] ];
+  return A, R, P, L;
+end function;
+
+// ===== Weight / support =====
+function HMWeightOfMonomial(m, r)
+  exps := Exponents(m);
+  return &+[ exps[i]*r[i] : i in [1..7] ];
+end function;
+
+function SupportSet(R, r)
+  M3 := MonomialsOfDegree(R, 3);
+  return [ m : m in M3 | HMWeightOfMonomial(m, r) ge 0 ];
+end function;
+
+function ForbiddenAll(R, r_tgt)
+  M3 := MonomialsOfDegree(R, 3);
+  return [ m : m in M3 | HMWeightOfMonomial(m, r_tgt) lt 0 ];
+end function;
+
+function ImageViaL(L, exps)
+  P := Parent(L[1]);  F := P!1;
+  for j in [1..7] do
+    if exps[j] ne 0 then F *:= L[j]^exps[j]; end if;
+  end for;
+  return F;
+end function;
+
+// ===== Variables used in A-polynomials =====
+function VarsInPolys(polys)
+  if #polys eq 0 then return {}; end if;
+  idxs := {};
+  for f in polys do
+    for m in Monomials(f) do
+      ex := Exponents(m);
+      for i in [1..#ex] do
+        if ex[i] gt 0 then Include(~idxs, i); end if;
+      end for;
+    end for;
+  end for;
+  return idxs;
+end function;
+
+function OrderCandidatesByFreq(eqsS, candSet)
+  if #candSet eq 0 then return []; end if;
+  if #eqsS eq 0 then
+    seq := SetToSequence(candSet); Sort(~seq); return seq;
+  end if;
+  counts := [ 0 : i in [1..Ngens(Parent(eqsS[1]))] ];
+  for f in eqsS do
+    for m in Monomials(f) do
+      ex := Exponents(m);
+      for i in [1..#ex] do if ex[i] gt 0 then counts[i] +:= 1; end if; end for;
+    end for;
+  end for;
+  seq := SetToSequence(candSet);
+  pairs := [ < -counts[idx], idx > : idx in seq ];
+  Sort(~pairs);
+  return [ p[2] : p in pairs ];
+end function;
+
+// ===== Forcing tests (RAB/SAT) =====
+function ForcedByRAB(A, eqs, v_idx)
+  if #eqs eq 0 then return false; end if;
+  B<h> := PolynomialRing(K, Ngens(A)+1, "grevlex");
+  phi := hom< A -> B | [ B.i : i in [1..Ngens(A)] ] >;
+  u := B.(Ngens(A)+1); vB := B.(v_idx);
+  J := ideal< B | [ phi(f) : f in eqs ] cat [ B!1 - u*vB ] >;
+  GB := GroebnerBasis(J);
+  return IsZero( NormalForm(B!1, GB) );
+end function;
+
+function ForcedBySAT(A, eqs, v_idx)
+  if #eqs eq 0 then return false; end if;
+  I := ideal< A | eqs >;
+  J := Saturation(I, ideal< A | A.(v_idx) >);
+  return A!1 in J;
+end function;
+
+// ===== Symbolic det(P) =====
+function BuildDetPoly(A)
+  entries := [ A.(IndexOf(i,j)) : i in [0..6], j in [0..6] ];
+  M := Matrix(A, 7, 7, entries);
+  return Determinant(M);
+end function;
+
+function DetIsZero_Symbolic(A, DET, zeros)
+  imgs := [ (k in zeros) select A!0 else A.k : k in [1..Ngens(A)] ];
+  phi  := hom< A -> A | imgs >;
+  return IsZero( phi(DET) );
+end function;
+
+// ===== Logging (Open/Puts-based I/O) =====
+procedure EnsureLog(path, header)
+  file_exists := true;
+  try _ := Read(path); catch e file_exists := false; end try;
+  if not file_exists then
+    F := Open(path, "w");  Puts(F, header);  delete F;
+  end if;
+end procedure;
+
+procedure AppendLog(path, line)
+  F := Open(path, "a");  Puts(F, line);  delete F;
+end procedure;
+
+// ---- Utilities (strings / log parsing / resume) ----
+function TrimRightNewlines(s)
+  while #s gt 0 and (s[#s] eq "\n" or s[#s] eq "\r") do
+    s := s[1..#s-1];
+  end while;
+  return s;
+end function;
+
+function StrToIntSafe(s)  return StringToInteger(s); end function;
+
+function IsResultVerdict(v)  return (#v ge 6) and (v[1..6] eq "RESULT"); end function;
+
+function ForcedNameOfIndex(idx)
+  i,j := IdxToIJ(idx); return Sprintf("p%o%o", i, j);
+end function;
+
+function ForcedNamesString(zeros)
+  if #zeros eq 0 then return ""; end if;
+  seq := SetToSequence(zeros); Sort(~seq);
+  parts := [ ForcedNameOfIndex(z) : z in seq ];
+  s := parts[1];
+  for t in [2..#parts] do s := s cat " " cat parts[t]; end for;
+  return s;
+end function;
+
+function CollectAllForcedFromLog(path, k, l)
+  zeros := {}; content := ""; file_exists := true;
+  try content := Read(path); catch e file_exists := false; end try;
+  if not file_exists then return zeros; end if;
+  lines := Split(TrimRightNewlines(content), "\n");
+  if #lines le 1 then return zeros; end if;
+  for t in [2..#lines] do
+    L := lines[t]; if #L eq 0 then continue; end if;
+    Flds := Split(L, ","); if #Flds lt 12 then continue; end if;
+    kk := StrToIntSafe(Flds[1]);  ll := StrToIntSafe(Flds[2]);
+    if (kk ne k) or (ll ne l) then continue; end if;
+    verdict := Flds[9];
+    if verdict eq "FORCED" then
+      ii := StrToIntSafe(Flds[7]);  jj := StrToIntSafe(Flds[8]);
+      Include(~zeros, IndexOf(ii, jj));
+    end if;
+  end for;
+  return zeros;
+end function;
+
+function HasForcedVarsLine(path, k, l)
+  content := ""; file_exists := true;
+  try content := Read(path); catch e file_exists := false; end try;
+  if not file_exists then return false; end if;
+  lines := Split(TrimRightNewlines(content), "\n");
+  if #lines le 1 then return false; end if;
+  for t in [2..#lines] do
+    L := lines[t]; if #L eq 0 then continue; end if;
+    Flds := Split(L, ","); if #Flds lt 4 then continue; end if;
+    if (Flds[1] eq "FORCED_VARS")
+       and (StrToIntSafe(Flds[2]) eq k)
+       and (StrToIntSafe(Flds[3]) eq l) then
+      return true;
+    end if;
+  end for;
+  return false;
+end function;
+
+// returns: has_resume, finished, early, last_iter, last_t, last_total,
+//          zeros_before, zeros_in_iter, processed_in_iter, ms_offset
+function ParseResumeLog(path, k, l)
+  zeros_before := {}; zeros_in_iter := {}; processed_in_iter := {};
+  last_iter := 0; last_t := 0; last_total := 0; ms_offset := 0;
+  finished := false; early := false;
+
+  content := ""; file_exists := true;
+  try content := Read(path); catch e file_exists := false; end try;
+  if not file_exists then
+    return false, false, false, 0, 0, 0,
+           zeros_before, zeros_in_iter, processed_in_iter, 0;
+  end if;
+  content := TrimRightNewlines(content);
+  if #content eq 0 then
+    return false, false, false, 0, 0, 0,
+           zeros_before, zeros_in_iter, processed_in_iter, 0;
+  end if;
+
+  lines := Split(content, "\n");
+  if #lines le 1 then
+    return false, false, false, 0, 0, 0,
+           zeros_before, zeros_in_iter, processed_in_iter, 0;
+  end if;
+
+  // pass 1: last processed non-RESULT row
+  for t in [2..#lines] do
+    L := lines[t]; if #L eq 0 then continue; end if;
+    Flds := Split(L, ","); if #Flds lt 12 then continue; end if;
+    kk := StrToIntSafe(Flds[1]);  ll := StrToIntSafe(Flds[2]);
+    if (kk ne k) or (ll ne l) then continue; end if;
+    verdict := Flds[9];
+    if IsResultVerdict(verdict) then
+      finished := true; early := (verdict eq "RESULT_DET0_TRUE");
+      ms_offset := StrToIntSafe(Flds[12]);
+    else
+      it := StrToIntSafe(Flds[4]);  tt := StrToIntSafe(Flds[5]);
+      tot := StrToIntSafe(Flds[6]);  ms := StrToIntSafe(Flds[12]);
+      last_iter := it; last_t := tt; last_total := tot; ms_offset := ms;
+      finished := false;
+    end if;
+  end for;
+
+  if last_iter eq 0 then
+    return false, finished, early, 0, 0, 0,
+           zeros_before, zeros_in_iter, processed_in_iter, ms_offset;
+  end if;
+
+  // pass 2: rebuild zeros_before, zeros_in_iter, processed
+  for t in [2..#lines] do
+    L := lines[t]; if #L eq 0 then continue; end if;
+    Flds := Split(L, ","); if #Flds lt 12 then continue; end if;
+    kk := StrToIntSafe(Flds[1]);  ll := StrToIntSafe(Flds[2]);
+    if (kk ne k) or (ll ne l) then continue; end if;
+    verdict := Flds[9]; if IsResultVerdict(verdict) then continue; end if;
+
+    it := StrToIntSafe(Flds[4]);  tt := StrToIntSafe(Flds[5]);
+    ii := StrToIntSafe(Flds[7]);  jj := StrToIntSafe(Flds[8]);
+    idx := IndexOf(ii, jj);
+
+    if verdict eq "FORCED" then
+      if it lt last_iter then
+        Include(~zeros_before, idx);
+      elif (it eq last_iter) and (tt le last_t) then
+        Include(~zeros_in_iter, idx);
+      end if;
+    end if;
+    if it eq last_iter and (tt le last_t) then
+      Include(~processed_in_iter, idx);
+    end if;
+  end for;
+
+  return true, false, false, last_iter, last_t, last_total,
+         zeros_before, zeros_in_iter, processed_in_iter, ms_offset;
+end function;
+
+// ===== Row/Col stats =====
+function RowColZeroStats(zeros)
+  rowCnt := [ 0 : i in [0..6] ];
+  colCnt := [ 0 : j in [0..6] ];
+  for idx in zeros do
+    i,j := IdxToIJ(idx);
+    rowCnt[i+1] +:= 1;
+    colCnt[j+1] +:= 1;
+  end for;
+  fullRows := [ i-1 : i in [1..#rowCnt] | rowCnt[i] eq 7 ];
+  fullCols := [ j-1 : j in [1..#colCnt] | colCnt[j] eq 7 ];
+  return fullRows, fullCols, rowCnt, colCnt;
+end function;
+
+// ===== Forced-substitution (for DET/eqs reduction) =====
+function ReducePolysByZeros(A, plist, zeros)
+  if #plist eq 0 or #zeros eq 0 then return plist; end if;
+  imgs := [ (k in zeros) select A!0 else A.k : k in [1..Ngens(A)] ];
+  phi  := hom< A -> A | imgs >;
+  return [ phi(f) : f in plist ];
+end function;
+
+function ReducePolyByZeros(A, f, zeros)
+  if (#zeros eq 0) then return f; end if;
+  imgs := [ (k in zeros) select A!0 else A.k : k in [1..Ngens(A)] ];
+  phi  := hom< A -> A | imgs >;
+  return phi(f);
+end function;
+
+// ===== Final checks under det(P) ≠ 0 =====
+function FinalRAB_InvertibleDet_Unsat(A, eqs0, zeros, DET)
+  eqsR := ReducePolysByZeros(A, eqs0, zeros);
+  DETR := ReducePolyByZeros(A, DET, zeros);
+  B<h> := PolynomialRing(K, Ngens(A)+1, "grevlex");
+  phiB := hom< A -> B | [ B.i : i in [1..Ngens(A)] ] >;
+  u := B.(Ngens(A)+1);
+  J := ideal< B | [ phiB(f) : f in eqsR ] cat [ B!1 - u*phiB(DETR) ] >;
+  GB := GroebnerBasis(J);
+  return IsZero( NormalForm(B!1, GB) );
+end function;
+
+function FinalSAT_InvertibleDet_Unsat(A, eqs0, zeros, DET)
+  eqsR := ReducePolysByZeros(A, eqs0, zeros);
+  DETR := ReducePolyByZeros(A, DET, zeros);
+  I := ideal< A | eqsR >;
+  S := Saturation(I, ideal< A | DETR >);  // I : <DETR>^∞
+  return A!1 in S;
+end function;
+
+// ===== Solver for single (k,l) =====
+function SolveSinglePair(k, l : print_progress := true)
+  if print_progress then
+    printf "==== Solving pair (k,l)=(%o,%o) ====\n", k, l;
+  end if;
+
+  LOG_FILE := Sprintf("candidate_log_k%o_l%o.csv", k, l);
+  header   := "k,l,mode,iter,idx_of_list,idx_total,i,j,verdict,forced_so_far,eqs_total,ms";
+  EnsureLog(LOG_FILE, header);
+
+  A, R, P, L := BuildRingsAndL();
+  RVS := BuildRVecs();
+
+  if (k lt 1) or (k gt 21) or (l lt 1) or (l gt 21) or (k eq l) then
+    error Sprintf("Bad indices (k,l)=(%o,%o).", k, l);
+  end if;
+  if (#RVS[k] ne 7) or (#RVS[l] ne 7) then error "R-vectors missing."; end if;
+  if (&+RVS[k] ne 0) or (&+RVS[l] ne 0) then error "Nonzero-sum r_k or r_l."; end if;
+
+  r_src := RVS[k]; r_tgt := RVS[l];
+
+  forbids := ForbiddenAll(R, r_tgt);
+  Jsrc    := SupportSet(R, r_src);
+  if SHOW_LOGS then
+    printf "  #forbids(l)=%o, #source monomials=%o, ", #forbids, #Jsrc;
+  end if;
+
+  // Build base equations eqs0
+  eqs0 := [];
+  for n in forbids do
+    for m in Jsrc do
+      F := ImageViaL(L, Exponents(m));
+      c := MonomialCoefficient(F, n);
+      if c ne 0 then Append(~eqs0, c); end if;
+    end for;
+  end for;
+  if SHOW_LOGS then printf "total eqs=%o\n", #eqs0; end if;
+
+  // Precompute symbolic det(P)
+  DET := BuildDetPoly(A);
+
+  // ===== Resume info =====
+  has_resume, finished, early_old, last_iter, last_t, last_total,
+  zeros_before_iter, zeros_in_iter_done, processed_in_iter, ms_offset
+    := ParseResumeLog(LOG_FILE, k, l);
+
+  // already finished?
+  if finished then
+    print "  existing RESULT_* found in the log — nothing to resume.";
+    if not HasForcedVarsLine(LOG_FILE, k, l) then
+      zeros_all := CollectAllForcedFromLog(LOG_FILE, k, l);
+      forced_cnt_all := #zeros_all;
+      names := ForcedNamesString(zeros_all);
+      AppendLog(LOG_FILE, Sprintf("FORCED_VARS,%o,%o,%o,%o", k, l, forced_cnt_all, names));
+      printf "  appended FORCED_VARS (%o entries)\n", forced_cnt_all;
+    else
+      print "  FORCED_VARS line already present — no append.";
+    end if;
+    return early_old;
+  end if;
+
+  // reconstruct zeros known so far from the log
+  zeros := {};
+  for z in zeros_before_iter do Include(~zeros, z); end for;
+  for z in zeros_in_iter_done do Include(~zeros, z); end for;
+
+  extra := [ A.(idx) : idx in zeros ];
+  forced_cnt := #zeros;
+
+  if SHOW_LOGS then
+    if has_resume then
+      printf "  resume: last_iter=%o, last_t=%o, idx_total(last)=%o\n", last_iter, last_t, last_total;
+      printf "          forced(before_iter)=%o, forced(in_iter_done)=%o, processed_in_iter=%o\n",
+              #zeros_before_iter, #zeros_in_iter_done, #processed_in_iter;
+      printf "          forced_total_so_far=%o, ms_offset=%o\n", forced_cnt, ms_offset;
+    else
+      print  "  resume: no previous candidate rows for this pair (fresh start)";
+    end if;
+  end if;
+
+  t0 := Cputime();
+  structural_det_zero := false;
+
+  // ===== Option: jump straight to final checks when resuming
+  SKIP_ITERATIONS := has_resume and (not finished) and JUMP_TO_FINAL_ON_RESUME;
+  if SKIP_ITERATIONS then
+    if SHOW_LOGS then
+      print "  RESUME_JUMP_FINAL is ON: skipping remaining scans and running final checks now.";
+    end if;
+    ms_now := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+    AppendLog(LOG_FILE, Sprintf("RESUME_JUMP_FINAL,%o,%o,%o,%o,%o", k, l, forced_cnt, #eqs0, ms_now));
+  end if;
+
+  // ===== (A) If resuming and NOT skipping: finish ONLY the current iteration
+  if has_resume and (not SKIP_ITERATIONS) then
+    cand0 := VarsInPolys(eqs0);
+    for z in zeros_before_iter do
+      if z in cand0 then Exclude(~cand0, z); end if;
+    end for;
+    if #CANDIDATE_ROWS gt 0 then
+      filt := {};
+      for idx in cand0 do
+        ii,_ := IdxToIJ(idx);
+        if ii in CANDIDATE_ROWS then Include(~filt, idx); end if;
+      end for;
+      cand0 := filt;
+    end if;
+    cand_list := OrderCandidatesByFreq(eqs0, cand0);
+    if SHOW_LOGS then
+      printf "  [resume] recomputed idx_total=%o (log had %o)\n", #cand_list, last_total;
+    end if;
+
+    changed := false; t := 1;
+    while t le #cand_list do
+      idx := cand_list[t];
+      if idx in processed_in_iter then t +:= 1; continue; end if;
+      if idx in zeros then t +:= 1; continue; end if;
+
+      i,j := IdxToIJ(idx);
+      if SHOW_LOGS then printf "    [resume %o/%o] test p_(%o,%o) ...\n", t, #cand_list, i, j; end if;
+
+      eqs_work := eqs0 cat extra;
+      verdict := (CHECK_MODE eq "RAB")
+                 select ForcedByRAB(A, eqs_work, idx)
+                 else ForcedBySAT(A, eqs_work, idx);
+
+      if verdict then
+        if SHOW_LOGS then print "      -> FORCED"; end if;
+        Include(~zeros, idx); Append(~extra, A.(idx)); forced_cnt +:= 1; changed := true;
+
+        ms := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+        AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+          k,l,CHECK_MODE,last_iter,t,#cand_list,i,j,"FORCED",forced_cnt,#eqs0,ms));
+
+        if (forced_cnt ge EARLY_THRESHOLD) then
+          if SHOW_LOGS then printf "      -> early structural det(P)==0 check ... "; end if;
+          det_zero := DetIsZero_Symbolic(A, DET, zeros);
+          if SHOW_LOGS then print det_zero select "true" else "false"; end if;
+          if det_zero then structural_det_zero := true; break; end if;
+        end if;
+
+      else
+        if SHOW_LOGS then print "      -> not_forced"; end if;
+        ms := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+        AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+          k,l,CHECK_MODE,last_iter,t,#cand_list,i,j,"not_forced",forced_cnt,#eqs0,ms));
+      end if;
+
+      t +:= 1;
+    end while;
+
+    if (not structural_det_zero) and (not changed) and SHOW_LOGS then
+      print "  [resume] fixed point within this iteration (no new forced zeros)";
+    end if;
+  end if; // end finishing current iteration
+
+  // ===== (B) Fresh start: perform EXACTLY ONE sweep (iter = 1)
+  iter := (has_resume) select last_iter else 1;
+
+  if (not has_resume) and (not SKIP_ITERATIONS) and (not structural_det_zero) then
+    cand := VarsInPolys(eqs0);
+    if #CANDIDATE_ROWS gt 0 then
+      filt := {};
+      for idx in cand do
+        ii,_ := IdxToIJ(idx);
+        if ii in CANDIDATE_ROWS then Include(~filt, idx); end if;
+      end for;
+      cand := filt;
+    end if;
+
+    if SHOW_LOGS then printf "  [iter %o] #candidates=%o\n", iter, #cand; end if;
+
+    cand_list := OrderCandidatesByFreq(eqs0, cand);
+
+    t := 1;
+    while t le #cand_list do
+      idx := cand_list[t];
+      if idx in zeros then t +:= 1; continue; end if;
+
+      i,j := IdxToIJ(idx);
+      if SHOW_LOGS then printf "    [%o/%o] test p_(%o,%o) ...\n", t, #cand_list, i, j; end if;
+
+      eqs_work := eqs0 cat extra;
+      verdict := (CHECK_MODE eq "RAB")
+                 select ForcedByRAB(A, eqs_work, idx)
+                 else ForcedBySAT(A, eqs_work, idx);
+
+      if verdict then
+        if SHOW_LOGS then print "      -> FORCED"; end if;
+        Include(~zeros, idx); Append(~extra, A.(idx)); forced_cnt +:= 1;
+
+        ms := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+        AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+          k,l,CHECK_MODE,iter,t,#cand_list,i,j,"FORCED",forced_cnt,#eqs0,ms));
+
+        if (forced_cnt ge EARLY_THRESHOLD) then
+          if SHOW_LOGS then printf "      -> early structural det(P)==0 check ... "; end if;
+          det_zero := DetIsZero_Symbolic(A, DET, zeros);
+          if SHOW_LOGS then print det_zero select "true" else "false"; end if;
+          if det_zero then structural_det_zero := true; break; end if;
+        end if;
+
+      else
+        if SHOW_LOGS then print "      -> not_forced"; end if;
+        ms := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+        AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+          k,l,CHECK_MODE,iter,t,#cand_list,i,j,"not_forced",forced_cnt,#eqs0,ms));
+      end if;
+
+      t +:= 1;
+    end while;
+  end if; // end fresh single sweep
+
+  // ===== Summary =====
+  fullR, fullC, rowCnt, colCnt := RowColZeroStats(zeros);
+
+  print "";
+  print "[Summary] forced p_(i,j)=0:", forced_cnt, "entries";
+  if #fullR gt 0 then printf "  full-zero rows: %o\n", fullR; end if;
+  if #fullC gt 0 then printf "  full-zero cols: %o\n", fullC; end if;
+
+  // ===== Final structural det-check =====
+  if structural_det_zero then
+    print "  -> structural det(P)==0: true (from early check)";
+  else
+    print "  -> running FINAL structural det(P)==0 check ...";
+    structural_det_zero := DetIsZero_Symbolic(A, DET, zeros);
+    printf "  -> FINAL structural det(P)==0: %o\n",
+           structural_det_zero select "true" else "false";
+  end if;
+
+  // ===== Final RAB and SAT checks under det≠0 (both ALWAYS run if meaningful) =====
+  rab_unsat := false; sat_unsat := false;
+
+  // For logging sizes after reduction
+  eqsR := ReducePolysByZeros(A, eqs0, zeros);
+  DETR := ReducePolyByZeros(A, DET, zeros);
+  eqsR_cnt := #eqsR;
+  vars_left := 49 - forced_cnt;
+
+  ms_final := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+
+  if structural_det_zero then
+    // nothing meaningful to test under det≠0
+    AppendLog(LOG_FILE, Sprintf("FINAL_RAB,%o,%o,%o,%o,%o,%o",
+      k, l, eqsR_cnt, vars_left, "SKIPPED", ms_final));
+    AppendLog(LOG_FILE, Sprintf("FINAL_SAT,%o,%o,%o,%o,%o,%o",
+      k, l, eqsR_cnt, vars_left, "SKIPPED", ms_final));
+  else
+    if DO_FINAL_RAB then
+      print "  -> running FINAL RAB check under det(P) ≠ 0 (always) ...";
+      rab_unsat := FinalRAB_InvertibleDet_Unsat(A, eqs0, zeros, DET);
+      ms_rab := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+      printf "     RAB result: %o (1∈<eqs_R,1-u*det_R>)\n",
+             rab_unsat select "true" else "false";
+      AppendLog(LOG_FILE, Sprintf("FINAL_RAB,%o,%o,%o,%o,%o,%o",
+        k, l, eqsR_cnt, vars_left, rab_unsat select "true" else "false", ms_rab));
+    end if;
+    if DO_FINAL_SAT then
+      print "  -> running FINAL SAT (saturation) check under det(P) ≠ 0 (always) ...";
+      sat_unsat := FinalSAT_InvertibleDet_Unsat(A, eqs0, zeros, DET);
+      ms_sat := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+      printf "     SAT result: %o (1 ∈ Sat(<eqs_R>,<det_R>))\n",
+             sat_unsat select "true" else "false";
+      AppendLog(LOG_FILE, Sprintf("FINAL_SAT,%o,%o,%o,%o,%o,%o",
+        k, l, eqsR_cnt, vars_left, sat_unsat select "true" else "false", ms_sat));
+    end if;
+  end if;
+
+  // ===== RESULT line (single line) =====
+  print "";
+  print "== RESULT ==";
+  ms_final := ms_offset + Integers()!Floor(1000*Cputime(t0) + 0.5);
+
+  if structural_det_zero then
+    printf "[%o,%o] CERTIFIED: no invertible P (det(P)≡0 structurally). time=%o ms\n",
+           k, l, ms_final;
+    AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+      k,l,CHECK_MODE,iter,0,0,-1,-1,"RESULT_DET0_TRUE",forced_cnt,#eqs0,ms_final));
+  elif rab_unsat and sat_unsat then
+    printf "[%o,%o] CERTIFIED: BOTH RAB and SAT prove inconsistency on det≠0. time=%o ms\n",
+           k, l, ms_final;
+    AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+      k,l,CHECK_MODE,iter,0,0,-1,-1,"RESULT_BOTH_TRUE",forced_cnt,#eqs0,ms_final));
+  elif rab_unsat then
+    printf "[%o,%o] CERTIFIED: no invertible P (RAB proves inconsistency on det≠0). time=%o ms\n",
+           k, l, ms_final;
+    AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+      k,l,CHECK_MODE,iter,0,0,-1,-1,"RESULT_RAB_TRUE",forced_cnt,#eqs0,ms_final));
+  elif sat_unsat then
+    printf "[%o,%o] CERTIFIED: no invertible P (SAT proves inconsistency on det≠0). time=%o ms\n",
+           k, l, ms_final;
+    AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+      k,l,CHECK_MODE,iter,0,0,-1,-1,"RESULT_SAT_TRUE",forced_cnt,#eqs0,ms_final));
+  else
+    printf "[%o,%o] INCONCLUSIVE: forced=%o; time=%o ms\n",
+           k, l, forced_cnt, ms_final;
+    AppendLog(LOG_FILE, Sprintf("%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o,%o",
+      k,l,CHECK_MODE,iter,0,0,-1,-1,"RESULT_INCONCLUSIVE",forced_cnt,#eqs0,ms_final));
+  end if;
+
+  // ---- Append the FORCED variables list ----
+  names := ForcedNamesString(zeros);
+  AppendLog(LOG_FILE, Sprintf("FORCED_VARS,%o,%o,%o,%o", k, l, forced_cnt, names));
+  if SHOW_LOGS then
+    printf "  appended FORCED_VARS (%o entries)\n", forced_cnt;
+  end if;
+
+  return structural_det_zero or rab_unsat or sat_unsat;
+end function;
+
+// ===== Utilities to build pair lists =====
+function AllPairsKL()
+  L := [];
+  for k in [1..21] do
+    for l in [1..21] do
+      if k ne l then Append(~L, [k,l]); end if;
+    end for;
+  end for;
+  return L;
+end function;
+
+procedure RunPairs(pairs)
+  for pr in pairs do
+    k := pr[1];  l := pr[2];
+    _ := SolveSinglePair(k, l : print_progress := true);
+    print "";
+  end for;
+end procedure;
+
+// ---------------- Run dispatcher ----------------
+if RUN_MODE eq "ALL" then
+  RunPairs( AllPairsKL() );
+elif RUN_MODE eq "ONE" then
+  RunPairs( [ [SINGLE_K, SINGLE_L] ] );
+elif RUN_MODE eq "LIST" then
+  RunPairs( SELECTED_PAIRS );
+else
+  error Sprintf("Unknown RUN_MODE = %o. Use \"ALL\", \"ONE\" or \"LIST\".", RUN_MODE);
+end if;
+
+quit;

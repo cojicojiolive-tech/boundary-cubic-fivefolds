@@ -1,0 +1,162 @@
+-- ==============================================================
+--  isolated_k1_to_singular_v6.m2      (Macaulay2 ≥ 1.25)
+--  * Extract projective isolated singular points (codim = 6 only) for k = 1 (φ_nf_1)
+--  * For each minimal prime, automatically choose a variable not in the prime
+--    to dehomogenize (avoid duplicates and false positives)
+--  * Generate isolated_points.lst and arnold_classify.sing
+--  * Always use concatenate{...} for string concatenation (robustness)
+-- ==============================================================
+
+---------------------------------------------------------------
+-- 0.  Ring and polynomial (k=1 normal form)
+---------------------------------------------------------------
+R = QQ[x0,x1,x2,x3,x4,x5,x6];
+F = x2*x3^2 + x1*x3*x4 + x2^2*x5 + x0*x5^2 + x1^2*x6 + x0*x4*x6;
+
+varList  = for i from 0 to numgens R - 1 list R_i;            -- {x0,...,x6}
+varNames = for w in varList list toString w;                   -- {"x0",...}
+m        = ideal vars R;                                       -- irrelevant ideal for saturation
+
+---------------------------------------------------------------
+-- 1.  Projective singular-locus ideal (hypersurface ⇒ J suffices)
+--     Note: ideal(F)+J tends to introduce embedded components; avoid it
+---------------------------------------------------------------
+J     = ideal jacobian matrix {{F}};
+Iproj = saturate(J, m);
+
+mins  = minimalPrimes Iproj;          -- irreducible components (minimal primes)
+prims = primaryDecomposition Iproj;   -- reference (comparison/logging)
+
+print "*** Projective singular locus for k=1 (φ_nf_1) ***";
+print "------------------------------------------------------------";
+print(concatenate{"minimalPrimes : ", toString(#mins)});
+print(concatenate{"primaryDecomposition : ", toString(#prims)});
+print(concatenate{"associatedPrimes : ", toString(#associatedPrimes Iproj)});
+print "------------------------------------------------------------";
+
+-- Log: info for each minimal prime
+print "** minimalPrimes (irreducible components):";
+for C in mins list (
+  msg = concatenate{
+    "  codim=", toString codim C,
+    ", dim(P)=", toString (dim C - 1),
+    ", degree=", toString degree C,
+    ", gens=", toString mingens trim C
+  };
+  print msg;
+);
+
+---------------------------------------------------------------
+-- 2.  Extract projective points (codim = 6)
+---------------------------------------------------------------
+isProjPoint = C -> (codim C == numgens R - 1);
+isoPrimes   = select(mins, C -> isProjPoint C);
+
+if #isoPrimes == 0 then (
+  print "*** No isolated projective singular points were found. Exiting. ***";
+  exit 0
+);
+
+---------------------------------------------------------------
+-- 3.  Choose a chart variable (pick a variable not contained in the prime ideal)
+--     Example: if P = (x1,...,x6) then choose x0 and set x0 = 1 for dehomogenization
+---------------------------------------------------------------
+chooseChartVar = P -> (
+  for v in varList do (
+    if not isMember(v, P) then return v
+  );
+  error "No chart variable found (all variables lie in the prime ideal)";
+);
+
+---------------------------------------------------------------
+-- 4.  Projective coordinates and multiplicity (= degree)
+--     In the present k=1 case, one expects a single point [1:0:...:0]
+---------------------------------------------------------------
+coordsString = vChart -> (
+  -- Build the projective coordinate string "[1:0:...:0]" with vChart = 1 and others 0
+  s := "[";
+  for j from 0 to #varList - 1 do (
+    s = concatenate{s, (if varList#j === vChart then "1" else "0")};
+    if j < #varList - 1 then s = concatenate{s, ":"};
+  );
+  s = concatenate{s, "]"};
+  s
+);
+
+---------------------------------------------------------------
+-- 5.  Output file: isolated_points.lst
+---------------------------------------------------------------
+fpPts = openOut "isolated_points.lst";
+fpPts << "#F = " << toString F << endl;
+
+-- For each projective point, output its coordinates and multiplicity (= degree of the prime)
+for P in isoPrimes do (
+  vChart = chooseChartVar P;
+  fpPts << coordsString vChart << ", mult=" << toString degree P << endl;
+
+  print(concatenate{
+    "** isolated point : ", coordsString vChart,
+    "  (chart ", toString vChart, ", mult=", toString degree P, ")"
+  });
+);
+close fpPts;
+
+---------------------------------------------------------------
+-- 6.  Generate a Singular script: arnold_classify.sing
+--     - Substitute vChart=1 at each point to dehomogenize
+--     - Translate to the origin (here points are at 0, so effectively unchanged)
+--     - Call classify.lib via a safe wrapper (also prints μ and τ)
+---------------------------------------------------------------
+sg = openOut "arnold_classify.sing";
+sg << "// ============================================================\n";
+sg << "//  arnold_classify.sing  (generated by Macaulay2)\n";
+sg << "//  - For each projective isolated singular point of F\n";
+sg << "//  - Dehomogenize by setting (vChart = 1), translate to origin\n";
+sg << "//  - Use classify.lib to print type / mu / tau\n";
+sg << "// ============================================================\n\n";
+
+sg << "LIB \"classify.lib\";\n";
+sg << "proc safe_classify(poly f, string tag) {\n";
+sg << "  int mu = milnor(f);\n";
+sg << "  int tau = tjurina(f);\n";
+sg << "  list L = classify(f);\n";
+sg << "  if (size(L) > 0) {\n";
+sg << "    string typ = string(L[1]);\n";
+sg << "    print(tag + \": type=\" + typ + \", mu=\" + string(mu) + \", tau=\" + string(tau));\n";
+sg << "  } else {\n";
+sg << "    print(tag + \": classify() returned empty (mu=\" + string(mu) + \", tau=\" + string(tau) + \")\");\n";
+sg << "  }\n";
+sg << "}\n\n";
+
+ptIndex = 0;
+for P in isoPrimes do (
+  vChart   = chooseChartVar P;
+  vName    = toString vChart;
+  varUsed  = select(varNames, n -> n != vName);
+
+  -- (1) New ring (6 variables, excluding vChart)
+  sg << "// ========== projective point #" << toString ptIndex << " ==========\n";
+  sg << "ring R" << toString ptIndex << " = 0,(";
+  for j from 0 to #varUsed - 1 do (
+    sg << varUsed#j;
+    if j < (#varUsed - 1) then sg << ",";
+  );
+  sg << "),ds;\n";
+
+  -- (2) Substitute vChart = 1 (dehomogenize)
+  Fsub = substitute(F, vChart => 1);
+  sg << "poly F = " << toString Fsub << ";\n";
+
+  -- (3) Translate to the origin (here the point is 0, so unchanged)
+  sg << "poly f" << toString ptIndex << " = F;\n";
+
+  -- (4) Classification
+  sg << "safe_classify(f" << toString ptIndex << ", \"Point " << toString ptIndex << "\");\n\n";
+
+  ptIndex = ptIndex + 1;
+);
+
+sg << "quit;\n";
+close sg;
+
+print "\n*** Generated isolated_points.lst and arnold_classify.sing ***";
